@@ -1,0 +1,286 @@
+
+import glob
+import os
+import pandas as pd
+
+from collections import defaultdict
+import numpy as np
+from collections import Counter
+
+import time
+from datetime import datetime as dt
+import argparse
+import json
+import boto3
+from io import StringIO, BytesIO
+import joblib
+import sys
+import subprocess
+import logging
+import logging.handlers
+import calendar
+import tarfile
+
+
+###############################
+######### util 함수 설정 ##########
+###############################
+def _get_logger():
+    loglevel = logging.DEBUG
+    l = logging.getLogger(__name__)
+    if not l.hasHandlers():
+        l.setLevel(loglevel)
+        logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))        
+        l.handler_set = True
+    return l  
+logger = _get_logger()
+
+def get_secret():
+    secret_name = "dev/ForecastPalmOilPrice"
+    region_name = "ap-northeast-2"
+    
+    # Create a Secrets Manager client
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name,
+    )
+
+    try:
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secret_name
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'DecryptionFailureException': # Secrets Manager can't decrypt the protected secret text using the provided KMS key.
+            raise e
+        elif e.response['Error']['Code'] == 'InternalServiceErrorException': # An error occurred on the server side.
+            raise e
+        elif e.response['Error']['Code'] == 'InvalidParameterException': # You provided an invalid value for a parameter.
+            raise e
+        elif e.response['Error']['Code'] == 'InvalidRequestException': # You provided a parameter value that is not valid for the current state of the resource.
+            raise e
+        elif e.response['Error']['Code'] == 'ResourceNotFoundException': # We can't find the resource that you asked for.
+            raise e
+    else:
+        if 'SecretString' in get_secret_value_response:
+            secret = get_secret_value_response['SecretString']
+            return secret
+        else:
+            decoded_binary_secret = base64.b64decode(get_secret_value_response['SecretBinary'])
+            return decoded_binary_secret
+
+def check_performance_threshold(iput_df : pd.DataFrame,
+                                identifier: str,
+                                threshold : float = -100):
+    tmp = {}
+    satisfied_df = iput_df[iput_df['score_val'] > threshold]
+    if len(satisfied_df) > 0:
+        tmp['identifier'] = identifier
+        tmp['model'] = list(satisfied_df['model'])
+        tmp['performance'] = list(satisfied_df['score_val'])
+    return tmp
+
+def get_model_performance_report(data):
+    result = defaultdict(list)
+    models_ext = [row["model"] for row in data if row]
+    models = [item for sublist in models_ext for item in sublist]
+    performance_ext = [row["performance"] for row in data if row]
+    performance = [item for sublist in performance_ext for item in sublist]
+    
+    count_models = Counter(models)
+    
+    for keys, values in zip(models, performance):
+        result[keys].append(values)
+
+    for key, values in result.items():
+        result[key] = []
+        result[key].append(count_models[key])
+        result[key].append(sum(values) / len(values))
+        result[key].append(np.std(values))
+    
+    # 정렬 1순위 : 비즈니스담당자의 Metric에 선정된 Count 높은 순, 2순위: 표준편차가 작은 순(그래서 -처리해줌)
+    result = sorted(result.items(), key=lambda k_v: (k_v[1][0], -k_v[1][2]), reverse=True) 
+    return result
+
+def register_model_in_aws_registry(model_zip_path: str,
+                                   model_package_group_name: str,
+                                   model_description: str,
+                                   model_status: str,
+                                   sm_client) -> str:
+    create_model_package_input_dict = {
+        "ModelPackageGroupName": model_package_group_name,
+        "ModelPackageDescription": model_description,
+        "ModelApprovalStatus": model_status,
+        "InferenceSpecification": {
+            "Containers": [
+                {
+                    "Image": '763104351884.dkr.ecr.ap-northeast-2.amazonaws.com/autogluon-inference:0.4-cpu-py38',
+                    "ModelDataUrl": model_zip_path
+                }
+            ],
+            "SupportedContentTypes": ["text/csv"],
+            "SupportedResponseMIMETypes": ["text/csv"],
+        }
+    }
+    create_model_package_response = sm_client.create_model_package(**create_model_package_input_dict)
+    model_package_arn = create_model_package_response["ModelPackageArn"]
+    return model_package_arn
+
+
+def register_manifest(source_path,
+                      target_path,
+                      s3_client,
+                      BUCKET_NAME_USECASE):
+    template_json = {"fileLocations": [{"URIPrefixes": []}],
+                     "globalUploadSettings": {
+                         "format": "CSV",
+                         "delimiter": ","
+                     }}
+    paginator = s3_client.get_paginator('list_objects_v2')
+    response_iterator = paginator.paginate(Bucket = BUCKET_NAME_USECASE,
+                                           Prefix = source_path.split(BUCKET_NAME_USECASE+'/')[1]
+                                          )
+    for page in response_iterator:
+        for content in page['Contents']:
+            template_json['fileLocations'][0]['URIPrefixes'].append(f's3://{BUCKET_NAME_USECASE}/'+content['Key'])
+    with open(f'./manifest_testing.manifest', 'w') as f:
+        json.dump(template_json, f, indent=2)
+
+    res = s3_client.upload_file('./manifest_testing.manifest',
+                                BUCKET_NAME_USECASE,
+                                f"{target_path.split(BUCKET_NAME_USECASE+'/')[1]}/visual_validation.manifest")
+    return res
+    
+def refresh_of_spice_datasets(user_account_id,
+                              qs_data_name,
+                              BUCKET_NAME_USECASE,
+                              qs_client):
+    res = qs_client.list_data_sets(AwsAccountId = user_account_id)
+    datasets_ids = [summary["DataSetId"] for summary in res["DataSetSummaries"] if qs_data_name in summary["Name"]]
+    ingestion_ids = []
+
+    for dataset_id in datasets_ids:
+        try:
+            ingestion_id = str(calendar.timegm(time.gmtime()))
+            qs_client.create_ingestion(DataSetId = dataset_id,
+                                       IngestionId = ingestion_id,
+                                       AwsAccountId = user_account_id)
+            ingestion_ids.append(ingestion_id)
+        except Exception as e:
+            print(e)
+            pass
+    for ingestion_id, dataset_id in zip(ingestion_ids, datasets_ids):
+        while True:
+            response = qs_client.describe_ingestion(DataSetId = dataset_id,
+                                                    IngestionId = ingestion_id,
+                                                    AwsAccountId = user_account_id)
+            if response['Ingestion']['IngestionStatus'] in ('INITIALIZED', 'QUEUED', 'RUNNING'):
+                time.sleep(5)     #change sleep time according to your dataset size
+            elif response['Ingestion']['IngestionStatus'] == 'COMPLETED':
+                print("refresh completed. RowsIngested {0}, RowsDropped {1}, IngestionTimeInSeconds {2}, IngestionSizeInBytes {3}".format(
+                    response['Ingestion']['RowInfo']['RowsIngested'],
+                    response['Ingestion']['RowInfo']['RowsDropped'],
+                    response['Ingestion']['IngestionTimeInSeconds'],
+                    response['Ingestion']['IngestionSizeInBytes']))
+                break
+            else:
+                print("refresh failed for {0}! - status {1}".format(dataset_id,
+                                                                    response['Ingestion']['IngestionStatus']))
+                break
+    return res
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--leaderboard_path', type=str, default="/opt/ml/processing/input/leaderboard")   
+    parser.add_argument('--model_base_path', type=str)
+    parser.add_argument('--manifest_base_path', type=str)
+    parser.add_argument('--prediction_base_path', type=str)
+    parser.add_argument('--threshold', type=str, default="-100")   
+    parser.add_argument('--model_package_group_name', type=str, default = BUCKET_NAME_USECASE)  
+    parser.add_argument('--qs_data_name', type=str, default = 'model_result')    
+
+    return parser.parse_args()
+
+
+if __name__=='__main__':
+    logger.info(f"\n### Loading Key value from Secret Manager")
+    keychain = json.loads(get_secret())
+    ACCESS_KEY_ID = keychain['AWS_ACCESS_KEY_ID']
+    ACCESS_SECRET_KEY = keychain['AWS_ACCESS_SECRET_KEY']
+    BUCKET_NAME_USECASE = keychain['PROJECT_BUCKET_NAME']
+    DATALAKE_BUCKET_NAME = keychain['DATALAKE_BUCKET_NAME']
+    S3_PATH_REUTER = keychain['S3_PATH_REUTER']
+    S3_PATH_WWO = keychain['S3_PATH_WWO']
+    S3_PATH_STAGE = keychain['S3_PATH_STAGE']
+    S3_PATH_GOLDEN = keychain['S3_PATH_GOLDEN']
+    S3_PATH_TRAIN = keychain['S3_PATH_TRAIN']
+    S3_PATH_FORECAST = keychain['S3_PATH_PREDICTION']
+    
+    boto3_session = boto3.Session(aws_access_key_id = ACCESS_KEY_ID,
+                                  aws_secret_access_key = ACCESS_SECRET_KEY,
+                                  region_name = 'ap-northeast-2')
+    
+    s3_client = boto3_session.client('s3')
+    sm_client = boto3_session.client('sagemaker')
+    qs_client = boto3_session.client('quicksight')
+
+    sts_client = boto3_session.client("sts")
+    user_account_id = sts_client.get_caller_identity()["Account"]
+    ######################################
+    ## 커맨드 인자, Hyperparameters 처리 ##
+    ######################################
+    args = parse_args()
+
+    logger.info("######### Argument Info ####################################")
+    logger.info("### start training code")    
+    logger.info("### Argument Info ###")
+    logger.info(f"args.leaderboard_path: {args.leaderboard_path}")    
+    logger.info(f"args.model_base_path: {args.model_base_path}")
+    logger.info(f"args.manifest_base_path: {args.manifest_base_path}")
+    logger.info(f"args.prediction_base_path: {args.prediction_base_path}")
+    logger.info(f"args.threshold: {args.threshold}")
+    logger.info(f"args.model_package_group_name: {args.model_package_group_name}")
+    logger.info(f"args.qs_data_name: {args.qs_data_name}")
+  
+    leaderboard_path = args.leaderboard_path
+    model_base_path = args.model_base_path
+    manifest_base_path = args.manifest_base_path
+    prediction_base_path = args.prediction_base_path
+    threshold = float(args.threshold)
+    model_package_group_name = args.model_package_group_name
+    qs_data_name = args.qs_data_name
+    
+    lb_list = sorted(os.listdir(leaderboard_path))
+    logger.info(f"leaderboard file list in {leaderboard_path}: {lb_list}")
+    satisfied_info = []
+    
+    for idx, f_path in enumerate(lb_list):
+        leaderboard = pd.read_csv(f'{leaderboard_path}/{f_path}').sort_values(by = ['score_val', 'score_test'],
+                                                                              ascending = False)
+        satisfied_info.append(check_performance_threshold(iput_df = leaderboard,
+                                                          identifier = f'fold{idx}',
+                                                          threshold = threshold))
+    model_report = get_model_performance_report(satisfied_info)
+
+    if model_report[0][1][0] == len(lb_list): # Fold 내 모든 성능이 비즈니스 담당자가 설정한 값을 만족한다면
+        logger.info(f"\n#### Pass the 1st minimum performance valiation")
+        response = register_manifest(prediction_base_path, 
+                                     manifest_base_path,
+                                     s3_client,
+                                     BUCKET_NAME_USECASE)
+        model_package_arn = register_model_in_aws_registry(f"{model_base_path}/model.tar.gz",
+                                                           model_package_group_name,
+                                                           ','.join(map(str,  model_report[0])),
+                                                           'PendingManualApproval',
+                                                           sm_client)
+        logger.info('### Passed ModelPackage Version ARN : {}'.format(model_package_arn))
+        res = refresh_of_spice_datasets(user_account_id, qs_data_name, BUCKET_NAME_USECASE, qs_client)
+        logger.info('### refresh_of_spice_datasets : {}'.format(res))
+    else:
+        logger.info(f"\n#### Filtered at 1st valiation")
+        model_package_arn = register_model_in_aws_registry(f"{model_base_path}/model.tar.gz",
+                                                           model_package_group_name,
+                                                           ','.join(map(str,  model_report[0])),
+                                                           'Rejected',
+                                                           sm_client)
+        logger.info('### Rejected ModelPackage Version ARN : {}'.format(model_package_arn))
